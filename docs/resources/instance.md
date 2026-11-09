@@ -254,6 +254,19 @@ resource "incus_instance" "instance1" {
 }
 ```
 
+## Example of giving an instance time to shut down
+
+```hcl
+resource "incus_instance" "instance1" {
+  name  = "instance1"
+  image = "images:debian/12"
+
+  stop = {
+    timeout = "5m"
+  }
+}
+```
+
 ## Argument Reference
 
 * `name` - **Required** - Name of the instance.
@@ -272,6 +285,8 @@ resource "incus_instance" "instance1" {
 * `ephemeral` - *Optional* - Boolean indicating if this instance is ephemeral. Defaults to `false`.
 
 * `running` - *Optional* - Boolean indicating whether the instance should be started (running). Defaults to `true`.
+
+* `stop` - *Optional* - How the provider stops the instance. See reference below.
 
 * `wait_for` - *Optional* - WaitFor definition. See reference below.
   If `running` is set to false or instance is already running (on update), this value has no effect.
@@ -305,6 +320,18 @@ The `source_instance` block supports:
 * `name` - **Required** - Name of the source instance.
 
 * `snapshot`- *Optional* - Name of the snapshot of the source instance
+
+The `stop` block supports:
+
+* `timeout` - **Required** - How long to wait for the instance to shut down when the provider stops it, e.g. `30s`. At least `1s`.
+
+* `on_timeout` - *Optional* - What to do when the instance is still running after `timeout`.
+  `force` force-stops the instance and continues; `fail` returns an error and leaves the instance running.
+  Defaults to `force`.
+
+The provider stops an instance when `running` changes to `false`, before a rename, and before it deletes the instance on destroy or replacement.
+Without `stop`, a stop on update or rename waits 3 minutes and returns an error if the instance is still running, and destroy force-stops the instance.
+Destroy uses `stop` from the state, so a new `stop` takes effect on destroy after it has been applied.
 
 The `wait_for` block supports:
 
