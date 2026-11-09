@@ -23,6 +23,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/boolplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/objectplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringdefault"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
 	"github.com/hashicorp/terraform-plugin-framework/tfsdk"
@@ -46,6 +47,7 @@ type InstanceModel struct {
 	Image          types.String `tfsdk:"image"`
 	Ephemeral      types.Bool   `tfsdk:"ephemeral"`
 	Running        types.Bool   `tfsdk:"running"`
+	Stop           types.Object `tfsdk:"stop"`
 	WaitForConfigs types.Set    `tfsdk:"wait_for"`
 	Profiles       types.List   `tfsdk:"profiles"`
 	Devices        types.Set    `tfsdk:"device"`
@@ -79,6 +81,11 @@ type SourceInstanceModel struct {
 	Project  types.String `tfsdk:"project"`
 	Name     types.String `tfsdk:"name"`
 	Snapshot types.String `tfsdk:"snapshot"`
+}
+
+type StopModel struct {
+	Timeout   types.String `tfsdk:"timeout"`
+	OnTimeout types.String `tfsdk:"on_timeout"`
 }
 
 type WaitForModel struct {
@@ -203,6 +210,26 @@ func (r InstanceResource) Schema(_ context.Context, _ resource.SchemaRequest, re
 				Optional: true,
 				Computed: true,
 				Default:  booldefault.StaticBool(true),
+			},
+
+			"stop": schema.SingleNestedAttribute{
+				Optional: true,
+				Attributes: map[string]schema.Attribute{
+					"timeout": schema.StringAttribute{
+						Required: true,
+						Validators: []validator.String{
+							stopTimeoutValidator{},
+						},
+					},
+					"on_timeout": schema.StringAttribute{
+						Optional: true,
+						Computed: true,
+						Default:  stringdefault.StaticString("force"),
+						Validators: []validator.String{
+							stringvalidator.OneOf("force", "fail"),
+						},
+					},
+				},
 			},
 
 			// If profiles are null, use "default" profile.
@@ -961,10 +988,9 @@ func (r InstanceResource) Update(ctx context.Context, req resource.UpdateRequest
 
 	// Stop before applying configuration changes if the desired state is stopped.
 	if !plan.Running.ValueBool() && !isInstanceStopped(*instanceState) {
-		// Stop the instance gracefully.
-		_, diag := stopInstance(ctx, server, instanceName, false)
-		if diag != nil {
-			resp.Diagnostics.Append(diag)
+		_, diags := stopInstanceAsConfigured(ctx, server, instanceName, plan.Stop, false)
+		resp.Diagnostics.Append(diags...)
+		if diags.HasError() {
 			return
 		}
 	}
@@ -1155,10 +1181,9 @@ func (r InstanceResource) Update(ctx context.Context, req resource.UpdateRequest
 
 		// Stop instance if it's running (required for rename operation)
 		if !isInstanceStopped(*instanceState) {
-			// Stop the instance gracefully.
-			_, diag := stopInstance(ctx, server, instanceName, false)
-			if diag != nil {
-				resp.Diagnostics.Append(diag)
+			_, diags := stopInstanceAsConfigured(ctx, server, instanceName, plan.Stop, false)
+			resp.Diagnostics.Append(diags...)
+			if diags.HasError() {
 				return
 			}
 		}
@@ -1292,15 +1317,15 @@ func (r InstanceResource) Delete(ctx context.Context, req resource.DeleteRequest
 
 	instanceName := state.Name.ValueString()
 
-	// Force stop the instance, because we are deleting it anyway.
-	isFound, diag := stopInstance(ctx, server, instanceName, true)
-	if diag != nil {
+	// Without a stop configuration, force-stop the instance, because we are deleting it anyway.
+	isFound, diags := stopInstanceAsConfigured(ctx, server, instanceName, state.Stop, true)
+	if diags.HasError() {
 		// Ephemeral instances will be removed when stopped.
 		if !isFound {
 			return
 		}
 
-		resp.Diagnostics.Append(diag)
+		resp.Diagnostics.Append(diags...)
 		return
 	}
 
@@ -1936,6 +1961,11 @@ func stopInstance(ctx context.Context, server incus.InstanceServer, instanceName
 		return true, diag.NewErrorDiagnostic(fmt.Sprintf("Failed to stop instance %q", instanceName), err.Error())
 	}
 
+	return waitForInstanceStopped(ctx, server, instanceName)
+}
+
+// waitForInstanceStopped waits until the API reports the instance as stopped.
+func waitForInstanceStopped(ctx context.Context, server incus.InstanceServer, instanceName string) (bool, diag.Diagnostic) {
 	instanceStoppedCheck := func() (any, string, error) {
 		st, _, err := server.GetInstanceState(instanceName)
 		if err != nil {
@@ -1947,13 +1977,136 @@ func stopInstance(ctx context.Context, server incus.InstanceServer, instanceName
 
 	// Even though op.Wait has completed, wait until we can see
 	// the instance is stopped via a new API call.
-	_, err = waitForState(ctx, instanceStoppedCheck, api.Stopped.String())
+	_, err := waitForState(ctx, instanceStoppedCheck, api.Stopped.String())
 	if err != nil {
 		found := !errors.IsNotFoundError(err)
 		return found, diag.NewErrorDiagnostic(fmt.Sprintf("Failed to wait for instance %q to stop", instanceName), err.Error())
 	}
 
 	return true, nil
+}
+
+// stopForceMargin is the time kept before a context deadline for a force-stop.
+const stopForceMargin = 30 * time.Second
+
+// stopSettings holds a parsed stop attribute.
+type stopSettings struct {
+	timeout time.Duration
+	force   bool
+}
+
+// toStopSettings parses the stop attribute, returning nil when it is not set.
+func toStopSettings(ctx context.Context, stop types.Object) (*stopSettings, diag.Diagnostics) {
+	if stop.IsNull() || stop.IsUnknown() {
+		return nil, nil
+	}
+
+	var model StopModel
+	diags := stop.As(ctx, &model, basetypes.ObjectAsOptions{})
+	if diags.HasError() {
+		return nil, diags
+	}
+
+	timeout, err := time.ParseDuration(model.Timeout.ValueString())
+	if err != nil {
+		diags.AddError("Invalid stop timeout", err.Error())
+		return nil, diags
+	}
+
+	settings := &stopSettings{
+		timeout: timeout,
+		force:   model.OnTimeout.ValueString() != "fail",
+	}
+
+	return settings, diags
+}
+
+// stopInstanceAsConfigured stops the instance as the stop attribute configures, or with legacyForce when it is not set.
+func stopInstanceAsConfigured(ctx context.Context, server incus.InstanceServer, instanceName string, stop types.Object, legacyForce bool) (bool, diag.Diagnostics) {
+	settings, diags := toStopSettings(ctx, stop)
+	if diags.HasError() {
+		return true, diags
+	}
+
+	var found bool
+	var d diag.Diagnostic
+	if settings == nil {
+		found, d = stopInstance(ctx, server, instanceName, legacyForce)
+	} else {
+		found, d = stopInstanceWithTimeout(ctx, server, instanceName, *settings)
+	}
+
+	if d != nil {
+		diags.Append(d)
+	}
+
+	return found, diags
+}
+
+// stopInstanceWithTimeout stops the instance and waits up to the timeout for it to shut down.
+// An instance still running after that is force-stopped, or an error is returned, as configured.
+func stopInstanceWithTimeout(ctx context.Context, server incus.InstanceServer, instanceName string, settings stopSettings) (bool, diag.Diagnostic) {
+	st, etag, err := server.GetInstanceState(instanceName)
+	if err != nil {
+		return true, diag.NewErrorDiagnostic(fmt.Sprintf("Failed to retrieve state of instance %q", instanceName), err.Error())
+	}
+
+	if isInstanceStopped(*st) {
+		return true, nil
+	}
+
+	// Leave time for a force-stop before the context deadline.
+	timeout := settings.timeout
+	deadline, ok := ctx.Deadline()
+	if ok {
+		remaining := time.Until(deadline)
+		if settings.force {
+			remaining -= stopForceMargin
+		}
+
+		timeout = min(timeout, remaining)
+	}
+
+	if timeout < time.Second {
+		if !settings.force {
+			return true, diag.NewErrorDiagnostic(fmt.Sprintf("Not enough time left to stop instance %q", instanceName), "The operation deadline is closer than one second.")
+		}
+
+		return stopInstance(ctx, server, instanceName, true)
+	}
+
+	// Incus treats a timeout of 0 as a force-stop, so only whole seconds of at least 1 are sent.
+	stopReq := api.InstanceStatePut{
+		Action:  "stop",
+		Force:   false,
+		Timeout: int(timeout / time.Second),
+	}
+
+	op, err := server.UpdateInstanceState(instanceName, stopReq, etag)
+	if err == nil {
+		err = op.WaitContext(ctx)
+	}
+
+	if err == nil {
+		return waitForInstanceStopped(ctx, server, instanceName)
+	}
+
+	// Decide by the state, not by the error, whether the instance is still running.
+	st, _, stateErr := server.GetInstanceState(instanceName)
+	if stateErr != nil {
+		found := !errors.IsNotFoundError(stateErr)
+		return found, diag.NewErrorDiagnostic(fmt.Sprintf("Failed to retrieve state of instance %q", instanceName), stateErr.Error())
+	}
+
+	if isInstanceStopped(*st) {
+		return true, nil
+	}
+
+	if !settings.force {
+		return true, diag.NewErrorDiagnostic(fmt.Sprintf("Instance %q did not stop within %s", instanceName, timeout.Truncate(time.Second)), err.Error())
+	}
+
+	return stopInstance(ctx, server, instanceName, true)
 }
 
 // waitFor waits for the instance with the given name to reach the desired
