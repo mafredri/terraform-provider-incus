@@ -1553,6 +1553,91 @@ func TestAccInstance_virtualMachineRename(t *testing.T) {
 	})
 }
 
+func TestAccInstance_stopTimeout(t *testing.T) {
+	instanceName := petname.Generate(2, "-")
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { acctest.PreCheck(t) },
+		ProtoV6ProviderFactories: acctest.ProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				Config: testAccInstance_stopTimeout(instanceName, true, "1m", "fail", ""),
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr("incus_instance.instance1", "status", "Running"),
+					resource.TestCheckResourceAttr("incus_instance.instance1", "stop.timeout", "1m"),
+					resource.TestCheckResourceAttr("incus_instance.instance1", "stop.on_timeout", "fail"),
+				),
+			},
+			{
+				// The instance shuts down within the timeout.
+				Config: testAccInstance_stopTimeout(instanceName, false, "1m", "fail", ""),
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr("incus_instance.instance1", "status", "Stopped"),
+					resource.TestCheckResourceAttr("incus_instance.instance1", "running", "false"),
+				),
+			},
+		},
+	})
+}
+
+func TestAccInstance_stopTimeoutFail(t *testing.T) {
+	instanceName := petname.Generate(2, "-")
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { acctest.PreCheck(t) },
+		ProtoV6ProviderFactories: acctest.ProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				Config: testAccInstance_stopTimeout(instanceName, true, "2s", "fail", "SIGCONT"),
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr("incus_instance.instance1", "status", "Running"),
+				),
+			},
+			{
+				// The instance ignores the stop and is left running.
+				Config:      testAccInstance_stopTimeout(instanceName, false, "2s", "fail", "SIGCONT"),
+				ExpectError: regexp.MustCompile(fmt.Sprintf("Instance %q did not stop within 2s", instanceName)),
+			},
+			{
+				Config: testAccInstance_stopTimeout(instanceName, true, "2s", "fail", "SIGCONT"),
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr("incus_instance.instance1", "status", "Running"),
+				),
+			},
+			{
+				// The default on_timeout force-stops the instance.
+				Config: testAccInstance_stopTimeout(instanceName, false, "2s", "", "SIGCONT"),
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr("incus_instance.instance1", "status", "Stopped"),
+					resource.TestCheckResourceAttr("incus_instance.instance1", "stop.on_timeout", "force"),
+				),
+			},
+		},
+	})
+}
+
+func TestAccInstance_stopTimeoutDestroy(t *testing.T) {
+	instanceName := petname.Generate(2, "-")
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { acctest.PreCheck(t) },
+		ProtoV6ProviderFactories: acctest.ProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				Config: testAccInstance_stopTimeout(instanceName, true, "2s", "force", "SIGCONT"),
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr("incus_instance.instance1", "status", "Running"),
+				),
+			},
+			{
+				// Destroy force-stops the instance after the timeout.
+				Config:  testAccInstance_stopTimeout(instanceName, true, "2s", "force", "SIGCONT"),
+				Destroy: true,
+			},
+		},
+	})
+}
+
 func testAccInstance_basic(name string, image string) string {
 	return fmt.Sprintf(`
 resource "incus_instance" "instance1" {
@@ -2789,4 +2874,34 @@ resource "incus_instance" "instance1" {
   }
 }
 	`, networkName, instanceName, acctest.TestImage)
+}
+
+func testAccInstance_stopTimeout(name string, running bool, timeout string, onTimeout string, haltSignal string) string {
+	var onTimeoutConfig string
+	if onTimeout != "" {
+		onTimeoutConfig = fmt.Sprintf("on_timeout = %q", onTimeout)
+	}
+
+	// A halt signal that init ignores keeps the instance running after a stop.
+	var rawLXC string
+	if haltSignal != "" {
+		rawLXC = fmt.Sprintf(`"raw.lxc" = "lxc.signal.halt = %s"`, haltSignal)
+	}
+
+	return fmt.Sprintf(`
+resource "incus_instance" "instance1" {
+  name    = "%s"
+  image   = "%s"
+  running = %t
+
+  stop = {
+    timeout = "%s"
+    %s
+  }
+
+  config = {
+    %s
+  }
+}
+	`, name, acctest.TestImage, running, timeout, onTimeoutConfig, rawLXC)
 }
